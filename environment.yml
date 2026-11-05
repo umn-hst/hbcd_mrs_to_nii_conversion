@@ -3,6 +3,6 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.9.15
-  - spec2nii=0.6.1
+  - python=3.9.16
+  - spec2nii=0.8.7
   - nibabel=5.3.2

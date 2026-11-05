@@ -337,6 +337,43 @@ do
   fi
 done;
 
+# DICOM is a fallback only: accompanying DICOM files must not replace an
+# existing raw-data path. Ignore macOS ZIP metadata, not spectroscopy data.
+# The extension is shared by vendors, so inspect Manufacturer before dispatch.
+# Reject mixed or unsupported vendors rather than send them to the wrong reader.
+if [[ $Format == "none" ]] &&
+   [[ -n $(find "$TopLevelDIR" -type f -iname '*.dcm' ! -path '*/__MACOSX/*' ! -name '.*' -print -quit) ]] &&
+   [[ -z $(find "$TopLevelDIR" -type f \( -name '*.data' -o -name '*.dat' -o -name '*.7' -o -iname '*.sdat' \) -print -quit) ]]; then
+  Format=$(python - "$TopLevelDIR" <<'DICOM_FORMAT'
+from pathlib import Path
+import sys
+
+import pydicom
+
+staging = Path(sys.argv[1])
+formats = set()
+for path in staging.rglob("*"):
+    if not path.is_file() or path.suffix.lower() != ".dcm":
+        continue
+    if any(part.startswith(".") or part == "__MACOSX"
+           for part in path.relative_to(staging).parts):
+        continue
+    dataset = pydicom.dcmread(path, stop_before_pixels=True,
+                             specific_tags=["Manufacturer"])
+    manufacturer = str(dataset.get("Manufacturer", "")).strip().lower()
+    if manufacturer.startswith("philips"):
+        formats.add("philips_dcm")
+    elif manufacturer.startswith("siemens"):
+        formats.add("dicom")
+    else:
+        sys.exit("Unsupported or missing DICOM manufacturer; expected Philips or Siemens.")
+if len(formats) != 1:
+    sys.exit("Expected a single DICOM manufacturer per archive.")
+print(formats.pop())
+DICOM_FORMAT
+  ) || exit 1
+fi
+
 echo "############################"
 echo Data format: $Format
 echo Location of zip file: $ZipLoc
@@ -386,10 +423,120 @@ case $Format in
         ;;
     dicom)
         CMD="spec2nii dicom "
-        Ext=".dcm"
+      Ext=".[dD][cC][mM]"
         ;;
+    philips_dcm)
+      CMD="spec2nii philips_dcm "
+      Ext=".dcm"
+      ;;
 esac
 
+# Philips DICOM preprocessing produces the same staged HYPER filenames as
+# the other Philips formats. The shared loop below then names, anonymizes,
+# and exports every acquisition, including the two separate references.
+if [[ $Format == "philips_dcm" ]]; then
+  # Read run entities structurally for DICOM: the legacy fixed-width lookup
+  # above assumes the svs suffix and cannot reliably read mrsref filenames.
+  CounterStart=$(python - "$OutputDIR" "$StudyInstanceUID" <<'PHILIPS_RUN'
+import json
+from pathlib import Path
+import sys
+
+maximum = 0
+matching = []
+for sidecar in Path(sys.argv[1]).glob("*_run-*_*.json"):
+    run = int(sidecar.name.split("_run-")[1].split("_")[0])
+    maximum = max(maximum, run)
+    with sidecar.open() as stream:
+        metadata = json.load(stream)
+    if metadata.get("StudyInstanceUID", "None") == sys.argv[2]:
+        matching.append(run)
+print(min(matching) if matching else maximum + 1)
+PHILIPS_RUN
+  ) || exit 1
+  DICOMIndex=0
+  while IFS= read -r -d '' f; do
+    DICOMName="philips_dcm_$DICOMIndex"
+    $CMD "$f" --anon -f "$DICOMName" -o "$TopLevelDIR" || exit 1
+    # Enhanced Philips exports can mix metabolites and references even when
+    # water phase correction is NO. Use the private per-frame reference flag.
+    # Echo/edit ordering still follows the established HYPER convention:
+    # 32 short-TE scans, four-condition edited cycles, alternating 80/35-ms refs.
+    # Per-frame echo tags may not independently describe this ordering.
+    python - "$f" "$TopLevelDIR" "$DICOMName" <<'PHILIPS_DCM' || exit 1
+from pathlib import Path
+import sys
+
+import numpy as np
+import pydicom
+from nifti_mrs.create_nmrs import gen_nifti_mrs_hdr_ext
+from nifti_mrs.hdr_ext import Hdr_Ext
+from nifti_mrs.nifti_mrs import NIFTI_MRS
+from spec2nii.Philips.philips import _special_case_hyper
+
+
+def split_hyper(image, dataset, basename="HYPER"):
+    frames = dataset[(0x2005, 0x140f)].value
+    data = image[:]
+    if data.ndim != 5 or data.shape[4] != len(frames):
+        raise ValueError("Expected one dynamic dimension matching the DICOM frame sequence")
+    reference = np.array([bool(frame[(0x2005, 0x1304)].value) for frame in frames])
+    metabolites = data[..., ~reference]
+    water = data[..., reference]
+    if metabolites.shape[4] <= 32 or (metabolites.shape[4] - 32) % 4:
+        raise ValueError("HYPER requires 32 short-TE frames followed by complete four-condition cycles")
+    if water.shape[4] == 0 or water.shape[4] % 2:
+        raise ValueError("HYPER requires paired alternating 80/35-ms water references")
+    metadata = image.hdr_ext.to_dict()
+    metadata.pop("OriginalFile", None)
+    header = Hdr_Ext.from_header_ext(metadata)
+    images, names = _special_case_hyper(metabolites, image.dwelltime, header,
+                                       image.voxToWorldMat, basename + "_act")
+    for offset, echo, acquisition in ((0, 0.08, "edited"), (1, 0.035, "short_te")):
+        reference_header = header.copy()
+        reference_header.set_standard_def("WaterSuppressed", False)
+        reference_header.set_standard_def("EchoTime", echo)
+        reference_header.set_dim_info(0, "DIM_DYN")
+        images.append(gen_nifti_mrs_hdr_ext(water[..., offset::2], image.dwelltime,
+                                           reference_header, image.voxToWorldMat,
+                                           no_conj=True))
+        names.append(basename + "_ref_" + acquisition)
+    return images, names
+
+
+if __name__ == "__main__":
+    dataset = pydicom.dcmread(sys.argv[1])
+    if "philips" not in str(dataset.get("Manufacturer", "")).lower():
+        raise ValueError("Expected Philips spectroscopy DICOM")
+    staging = Path(sys.argv[2])
+    converted = sorted(staging.glob(sys.argv[3] + "*.nii.gz"))
+    if not converted:
+        raise ValueError("No Philips DICOM conversion output")
+    for source in converted:
+        image = NIFTI_MRS(source)
+        metadata = image.hdr_ext.to_dict()
+        protocol = str(metadata.get("ProtocolName", "")).lower()
+        if any(name in protocol for name in ("hyper", "isthmus")):
+            if len(converted) != 1:
+                raise ValueError("Expected combined HYPER data with frame-level reference flags")
+            images, names = split_hyper(image, dataset, "HYPER_" + sys.argv[3])
+            for result, name in zip(images, names):
+                result.save(staging / name)
+            source.unlink()
+        else:
+            if not any(np.isclose(float(metadata.get("EchoTime", 0)), echo)
+                       for echo in (0.03, 0.035, 0.08)):
+                raise ValueError("Cannot identify an HBCD acquisition from DICOM echo time")
+            metadata.pop("OriginalFile", None)
+            result = gen_nifti_mrs_hdr_ext(image[:], image.dwelltime,
+                                         Hdr_Ext.from_header_ext(metadata),
+                                         image.voxToWorldMat, no_conj=True)
+            result.save(source)
+PHILIPS_DCM
+    rm "$f"
+    DICOMIndex=$((DICOMIndex + 1))
+  done < <(find "$TopLevelDIR" -type f -iname '*.dcm' ! -path '*/__MACOSX/*' ! -name '.*' -print0)
+else
 # Loop over files found with the specified extension and perform conversion:
 for f in $(find "$TopLevelDIR" -type f -name "*$Ext");
 do
@@ -424,6 +571,7 @@ do
       rm "$f"
     fi
 done;
+fi
 
 # Separate loop for json dump and anonomize
 
@@ -547,6 +695,16 @@ do
       fi
     fi
 
+    # DICOM headers encode suppression directly; do not rely on TxOffset or
+    # a vendor filename to distinguish ordinary SVS and water references.
+    if [[ $Format == "philips_dcm" ]]; then
+      if [[ $WatSup == *"T"* ]]; then
+        Suff="svs"
+      else
+        Suff="mrsref"
+      fi
+    fi
+
     echo Suffix $Suff
     # NAMING CONVENTION FOR OUTPUT DATA
     # Initialize run counter:
@@ -585,7 +743,9 @@ do
         if [[ $Acq == *"hercules"* ]] && ! [[ $TE == *"0.08"* ]]; then
           nTE=0.08
         fi
-        if ! [[ $nTE == 0 ]]; then
+        # DICOM preprocessing already sets each block's echo and suppression.
+        # The legacy echo repair forces WaterSuppressed=True, including refs.
+        if [[ $Format != "philips_dcm" ]] && ! [[ $nTE == 0 ]]; then
 PYCMD=$(cat <<EOF
 import json
 jsonHeaderFile = open("$JsonOutFile")
